@@ -14,12 +14,12 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import copy
 from dataclasses import dataclass, field
 import json
-import math
 import pathlib
 from typing import Dict, Optional, Sequence
-
+import pickle
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -29,7 +29,7 @@ from transformers.trainer_pt_utils import LabelSmoother
 
 from fastchat.conversation import SeparatorStyle
 from fastchat.model.model_adapter import get_conversation_template
-
+from tqdm import tqdm
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
 
@@ -42,9 +42,6 @@ class ModelArguments:
 class DataArguments:
     data_path: str = field(
         default=None, metadata={"help": "Path to the training data."}
-    )
-    eval_data_path: str = field(
-        default=None, metadata={"help": "Path to the evaluation data."}
     )
     lazy_preprocess: bool = False
 
@@ -81,6 +78,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
 def preprocess(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
+    prompt="",
 ) -> Dict:
     conv = get_conversation_template("vicuna")
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -96,10 +94,12 @@ def preprocess(
         for j, sentence in enumerate(source):
             role = roles[sentence["from"]]
             assert role == conv.roles[j % 2], f"{i}"
-            conv.append_message(role, sentence["value"])
-        conversations.append(conv.get_prompt())
-
+            conv.append_message(role, sentence["content"] if "content" in sentence else sentence["value"])
+        format_conv = conv.get_prompt()
+        # format_conv = format_conv.replace(conv.system, prompt)
+        conversations.append(format_conv)
     # Tokenize conversations
+    tokenizer.model_max_length = 2048
     input_ids = tokenizer(
         conversations,
         return_tensors="pt",
@@ -110,45 +110,44 @@ def preprocess(
     targets = input_ids.clone()
 
     assert conv.sep_style == SeparatorStyle.ADD_COLON_TWO
-
     # Mask targets. Only compute loss on the assistant outputs.
-    sep = conv.sep + conv.roles[1] + ": "
+    sep = "\n" + conv.roles[1] + "\n"
     for conversation, target in zip(conversations, targets):
         total_len = int(target.ne(tokenizer.pad_token_id).sum())
-
-        turns = conversation.split(conv.sep2)
-        cur_len = 1
-        target[:cur_len] = IGNORE_TOKEN_ID
+        deli = conv.sep2 + "\n" + conv.roles[0] + "\n"
+        turns_ = conversation.split(deli)
+        if len(turns_) == 2 or len(turns_) == 1:
+            turns = [conversation]
+        else:
+            turns = [conv.roles[0] + "\n" + x + conv.sep2 + "\n" for x in turns_[2:-1]]
+            turns = turns + [conv.roles[0] + "\n" + turns_[-1]]
+            turns = [turns_[0] + conv.sep2 + "\n" +  conv.roles[0] + "\n" + turns_[1] + conv.sep2 + "\n"] + turns
+        assert "".join(turns) == conversation
+        cur_len = 0
         for i, turn in enumerate(turns):
             if turn == "":
                 break
             turn_len = len(tokenizer(turn).input_ids)
-
             parts = turn.split(sep)
             if len(parts) != 2:
                 break
             parts[0] += sep
-            # "-2" is hardcoded for the LLaMA tokenizer to make the offset correct.
-            instruction_len = len(tokenizer(parts[0]).input_ids) - 2
+            instruction_len = len(tokenizer(parts[0]).input_ids)
 
-            # Ignore the user instructions
             target[cur_len : cur_len + instruction_len] = IGNORE_TOKEN_ID
             cur_len += turn_len
+            target[cur_len - 1: cur_len+1] = IGNORE_TOKEN_ID
 
         target[cur_len:] = IGNORE_TOKEN_ID
+#    attention_mask = (input_ids.ne(tokenizer.pad_token_id) | targets.ne(IGNORE_TOKEN_ID)).long()
+#    for (i, input_id) in enumerate(input_ids):
+#        idx_max = (input_id != 0).nonzero(as_tuple=True)[0][-1].item()
+#        attention_mask[i, idx_max + 1:] = 0
+#        attention_mask[i, :idx_max + 1] = 1
 
-        if False:  # Inspect and check the correctness of masking
-            z = target.clone()
-            z = torch.where(z == IGNORE_TOKEN_ID, tokenizer.unk_token_id, z)
-            rank0_print(tokenizer.decode(z))
-
-        if cur_len < tokenizer.model_max_length:
-            if cur_len != total_len:
-                target[:] = IGNORE_TOKEN_ID
-                rank0_print(
-                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
-                    f" (ignored)"
-                )
+    # check tensors all equal to -100
+    for target in targets:
+        assert (target == IGNORE_TOKEN_ID).sum() != len(target)
 
     return dict(
         input_ids=input_ids,
@@ -164,9 +163,12 @@ class SupervisedDataset(Dataset):
         super(SupervisedDataset, self).__init__()
 
         rank0_print("Formatting inputs...")
-        sources = [example["conversations"] for example in raw_data]
+        sources = [example["conversations"] for example in tqdm(raw_data)]
         data_dict = preprocess(sources, tokenizer)
-
+        self.cached_data_dict = {}
+        for i in tqdm(range(len(sources))):
+            ret = preprocess([sources[i]], tokenizer)
+            self.cached_data_dict[i] = ret
         self.input_ids = data_dict["input_ids"]
         self.labels = data_dict["labels"]
         self.attention_mask = data_dict["attention_mask"]
@@ -192,16 +194,45 @@ class LazySupervisedDataset(Dataset):
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.raw_data = raw_data
-        self.cached_data_dict = {}
+        from datasets import load_from_disk
+        print("Load from disk")
+#        ds = load_from_disk("/fsx/codeai/FastChat/fastchat/train/data_hub/all_data_3b_except_orca")
+#        ds = load_from_disk("/fsx/codeai/FastChat/fastchat/train/data_hub/all_data_3b_except_orca_capybara")
+#        ds = load_from_disk("/fsx/codeai/FastChat/fastchat/train/data_hub/all_data_3b_glaive_slim_except_orca_canbara/")
+#        ds = load_from_disk("/fsx/codeai/FastChat/fastchat/train/data_hub/stablelm1.6b_instruct_glaive_math_slim_sharegpt_ultra_deita_2048/")
+#        ds = load_from_disk("/fsx/codeai/FastChat/fastchat/train/data_hub/all_data_4_jan_2048/")
+#        ds = load_from_disk("/fsx/codeai/FastChat/fastchat/train/data_hub/all_data_5_jan_2048/")
+#        ds = load_from_disk("/fsx/codeai/FastChat/fastchat/train/data_hub/stablelm1.6b_instruct_glaive_math_slim_sharegpt_ultra_deita_wizard_capybara_2048")
+        ds = load_from_disk("/fsx/codeai/FastChat/fastchat/train/data_hub/all_data_5_jan_2048_cleaned/")
+        self.cached_data_dict = ds.to_pandas()
 
     def __len__(self):
-        return len(self.raw_data)
+        return len(self.cached_data_dict)
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        input_ids = torch.tensor(self.cached_data_dict['input_ids'][i]).long()
+        labels = torch.tensor(self.cached_data_dict['labels'][i]).long()
+        attention_mask = torch.tensor(self.cached_data_dict['attention_mask'][i]).long()
+        # last value attention_mask equal to 1
+        eos_id = 100257
+        idx_max = (input_ids != eos_id).nonzero(as_tuple=True)[0][-1].item()
+        attention_mask[:idx_max] = 1
+        attention_mask[idx_max:] = 0
+        return dict(
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+        )
+
         if i in self.cached_data_dict:
             return self.cached_data_dict[i]
-
-        ret = preprocess([self.raw_data[i]["conversations"]], self.tokenizer)
+        try:
+            ret = preprocess([self.raw_data[i]["conversations"]], self.tokenizer)
+        except Exception as e:
+            print("error", e)
+            ret = preprocess([self.raw_data[i]["conversations"]], self.tokenizer)
+            i = 0
+            ret = preprocess([self.raw_data[i]["conversations"]], self.tokenizer)
         ret = dict(
             input_ids=ret["input_ids"][0],
             labels=ret["labels"][0],
@@ -212,6 +243,7 @@ class LazySupervisedDataset(Dataset):
         return ret
 
 
+
 def make_supervised_data_module(
     tokenizer: transformers.PreTrainedTokenizer, data_args
 ) -> Dict:
@@ -220,18 +252,31 @@ def make_supervised_data_module(
         LazySupervisedDataset if data_args.lazy_preprocess else SupervisedDataset
     )
     rank0_print("Loading data...")
-
-    train_json = json.load(open(data_args.data_path, "r"))
+    from datasets import load_dataset, concatenate_datasets, Dataset
+    import pandas as pd
+    import os
+    root = "/fsx/codeai/FastChat/fastchat/train/data_hub"
+    # data_paths = [ "ultrachat_200k.jsonl",  "capybara.jsonl", "codeai.jsonl", "meta-math.jsonl", "orca_gpt4_1M.jsonl","wizard_196k.jsonl"]
+    data_paths = [ "capybara.jsonl" ]
+    data_paths = [os.path.join(root, x) for x in data_paths]
+    train_json = []
+    for path in data_paths:
+        train_json += json.load(open(path, "r"))
     train_dataset = dataset_cls(train_json, tokenizer=tokenizer)
+    return dict(train_dataset=train_dataset, eval_dataset=train_dataset)
 
-    if data_args.eval_data_path:
-        eval_json = json.load(open(data_args.eval_data_path, "r"))
-        eval_dataset = dataset_cls(eval_json, tokenizer=tokenizer)
-    else:
-        eval_dataset = None
 
-    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset)
+from p_tqdm import p_map
 
+def preprocess_item(source):
+    tokenizer = transformers.AutoTokenizer.from_pretrained("stabilityai/stablelm-3b-4e1t")
+    tokenizer.pad_token = tokenizer.eos_token
+    try:
+        res = preprocess([source], tokenizer)
+    except Exception as e:
+        print(e)
+        res = None
+    return res
 
 def train():
     global local_rank
@@ -241,47 +286,47 @@ def train():
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
-
-    # Set RoPE scaling factor
-    config = transformers.AutoConfig.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
-    )
-    orig_ctx_len = getattr(config, "max_position_embeddings", None)
-    if orig_ctx_len and training_args.model_max_length > orig_ctx_len:
-        scaling_factor = float(math.ceil(training_args.model_max_length / orig_ctx_len))
-        config.rope_scaling = {"type": "linear", "factor": scaling_factor}
-    config.use_cache = False
-
-    # Load model and tokenizer
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
-        config=config,
-        cache_dir=training_args.cache_dir,
-    )
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
-        model_max_length=training_args.model_max_length,
-        padding_side="right",
-        use_fast=False,
+        trust_remote_code=True,
     )
-    tokenizer.pad_token = tokenizer.unk_token
-
-    # Load data
+    tokenizer.pad_token = tokenizer.eos_token
+    print("preparing data")
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    train_ds = data_module['train_dataset']
+    print(len(train_ds))
+    lst = [] 
+    import random
+    idxs = random.sample(range(0, len(train_ds)), 2000)
+    error = 0
+    for i in tqdm(idxs):
+        try:
+            lst.append(train_ds[i])
+        except Exception as e:
+            error += 1
+            print(e)
+    print("Number of error: ", error)
 
-    # Start trainner
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        "/fsx/ckpts/stablelm-1b-step498k",
+        trust_remote_code=True,
+    )
+    model.config.use_cache = False
+    model.gradient_checkpointing = True
+#    training_args.neftune_noise_alpha=5
+    print("Start training")
     trainer = Trainer(
         model=model, tokenizer=tokenizer, args=training_args, **data_module
     )
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
-    else:
-        trainer.train()
-    model.config.use_cache = True
-    trainer.save_state()
-    safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+#    if
+#    list(pathlib.Path(training_args.output_dir).glob("checkpoint-*"train_dataset)):
+#        trainer.train(resume_from_checkpoint=True)
+#    else:
+#        trainer.train()
+#    trainer.save_state()
+    print("Training now")
+    trainer.train()
+#    safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":
